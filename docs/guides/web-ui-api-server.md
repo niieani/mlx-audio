@@ -86,16 +86,28 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 | `model` | string | required | Model ID (HuggingFace repo or local path) |
 | `input` | string | required | Text to synthesize |
 | `voice` | string | `null` | Voice preset name |
+| `speaker` | int | `null` | Speaker ID for CSM/Miso-style multi-speaker generation |
 | `speed` | float | `1.0` | Playback speed multiplier |
+| `pitch` | float | `1.0` | Pitch multiplier for models that support it |
+| `gender` | string | `"male"` | Gender control for models that support it |
 | `lang_code` | string | `"a"` | Language code |
 | `response_format` | string | `"mp3"` | Output format: `mp3`, `wav`, `flac`, `ogg`, `opus` |
 | `stream` | bool | `false` | Stream audio chunks |
 | `streaming_interval` | float | `2.0` | Seconds between stream chunks |
 | `temperature` | float | `0.7` | Sampling temperature |
+| `top_p` | float | `0.95` | Nucleus sampling limit |
+| `top_k` | int | `40` | Top-k sampling limit |
+| `repetition_penalty` | float | `1.0` | Repetition penalty |
 | `max_tokens` | int | `1200` | Maximum generation tokens |
+| `max_audio_length_ms` | int | `null` | Maximum generated audio length in milliseconds for models that support it |
 | `ref_audio` | string | `null` | Path to reference audio for voice cloning |
 | `ref_text` | string | `null` | Transcript of reference audio |
+| `voice_match` | bool | `null` | CSM/Sesame voice matching mode |
 | `instruct` | string | `null` | Style/emotion instruction |
+
+For MisoTTS models, omit `voice` for the upstream promptless path. API
+`max_tokens` maps to Miso's `max_audio_length_ms` at 80 ms per token/frame, and
+omitted sampling fields use Miso's upstream defaults.
 
 #### Streaming TTS
 
@@ -304,7 +316,7 @@ Lower values reduce latency at the cost of accuracy. Models that don't declare a
 
 The Studio UI is a Next.js application located in `mlx_audio/ui/`. It provides:
 
-- A text input for TTS generation with voice and model selectors
+- A text input for TTS generation with preset model selectors and a custom local path / Hugging Face repo field
 - Audio upload and recording for STT
 - 3D audio visualization
 - Model loading and management

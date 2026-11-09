@@ -29,6 +29,8 @@ CSM-family models use the Sesame conversational speech architecture with voice c
         --text "Hello from Miso."
     ```
 
+    Miso configs that reference `meta-llama/Llama-3.2-1B` use the compatible public tokenizer fallback bundled in MLX Audio, so a Meta Llama token is not required for tokenizer loading.
+
 === "Python"
 
     ```python
@@ -127,9 +129,18 @@ for result in model.generate(
 | `voice` | `conversational_a` | Default voice preset (used when no `ref_audio` is provided) |
 | `speaker` | `0` | Speaker ID for multi-speaker context |
 | `max_audio_length_ms` | `90000` | Maximum audio length in milliseconds |
+| `temperature` | `0.9` | Sampling temperature |
+| `top_k` | `50` | Top-k sampling limit |
+| `top_p` | `0.0` | Nucleus sampling limit (`0.0` disables top-p) |
 | `stream` | `False` | Enable streaming output |
 | `streaming_interval` | `0.5` | Interval (seconds) between streamed chunks |
 | `voice_match` | `True` | Enable voice matching |
+
+MisoTTS follows the upstream Miso quickstart by default: no Sesame voice prompt
+is injected, speaker text is tokenized as `[0] text`, and the default sampler is
+`temperature=0.9`, `top_k=50`. Passing `ref_audio` + `ref_text`, or explicitly
+enabling `use_default_voice_prompt`/`voice_match` in the model config, opts into
+the Sesame-style prompted path.
 
 ## Links
 

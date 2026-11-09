@@ -22,6 +22,7 @@ MODEL_REMAPPING = {
     "spark": "spark",
     "marvis": "sesame",
     "csm": "sesame",
+    "miso_tts": "sesame",
     "voxcpm": "voxcpm",
     "voxcpm1.5": "voxcpm",
     "voxcpm2": "voxcpm2",

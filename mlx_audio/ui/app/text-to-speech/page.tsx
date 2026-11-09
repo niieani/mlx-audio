@@ -1,106 +1,73 @@
 "use client"
 
-import type React from "react"
-
 import { useState, useRef } from "react"
 import { ChevronDown, Download, ThumbsUp, ThumbsDown, Play, Pause, RefreshCw } from "lucide-react"
 import { LayoutWrapper } from "@/components/layout-wrapper"
-import { VoiceSelection } from "@/components/voice-selection"
-
-// Custom range input component with colored progress
-function RangeInput({
-  min,
-  max,
-  step,
-  value,
-  onChange,
-  className = "",
-  ariaLabel,
-}: {
-  min: number
-  max: number
-  step: number
-  value: number
-  onChange: (e: React.ChangeEvent<HTMLInputElement>) => void
-  className?: string
-  ariaLabel?: string
-}) {
-  const percentage = ((value - Number(min)) / (Number(max) - Number(min))) * 100
-
-  return (
-    <div className={`relative flex-1 ${className}`}>
-      <input
-        type="range"
-        min={min}
-        max={max}
-        step={step}
-        value={value}
-        onChange={onChange}
-        className="w-full appearance-none bg-transparent cursor-pointer"
-        aria-label={ariaLabel}
-        style={{
-          background: `linear-gradient(to right, #0ea5e9 0%, #0ea5e9 ${percentage}%, #e5e7eb ${percentage}%, #e5e7eb 100%)`,
-          height: "2px",
-          borderRadius: "2px",
-        }}
-      />
-    </div>
-  )
-}
+import { RangeInput } from "@/components/range-input"
+import {
+  CUSTOM_TTS_MODEL_VALUE,
+  TTS_MODEL_PRESETS,
+  type ResponseFormat,
+  buildTTSRequestPayload,
+  getAvailableQuantizations,
+  getDefaultVoiceForModel,
+  getDefaultVoiceMatchForModel,
+  isCustomModelSelection,
+  isMarvisModel,
+  isMisoModel,
+  resolveTTSModel,
+} from "@/lib/tts-models"
 
 export default function SpeechSynthesis() {
   const [text, setText] = useState("But I also have other interests, such as playing tic-tac-toe.")
   const [isPlaying, setIsPlaying] = useState(false)
   const [isGenerating, setIsGenerating] = useState(false)
   const [speed, setSpeed] = useState(1)
-  const [pitch, setPitch] = useState(0)
-  const [volume, setVolume] = useState(1)
+  const [pitch, setPitch] = useState(1)
   const [currentTime, setCurrentTime] = useState("00:00")
   const [duration, setDuration] = useState("00:04")
   const [activeTab, setActiveTab] = useState<"settings" | "history">("settings")
   const [baseModel, setBaseModel] = useState("Marvis-AI/marvis-tts-100m-v0.2")
+  const [customModel, setCustomModel] = useState("")
   const [quantization, setQuantization] = useState("6bit")
-  const [language, setLanguage] = useState("English-detected")
   const [liked, setLiked] = useState<boolean | null>(null)
   const [selectedVoice, setSelectedVoice] = useState("conversational_a")
+  const [speaker, setSpeaker] = useState(0)
+  const [voiceMatch, setVoiceMatch] = useState(true)
+  const [gender, setGender] = useState("male")
+  const [refAudio, setRefAudio] = useState("")
+  const [refText, setRefText] = useState("")
+  const [temperature, setTemperature] = useState(0.7)
+  const [topP, setTopP] = useState(0.95)
+  const [topK, setTopK] = useState(40)
+  const [repetitionPenalty, setRepetitionPenalty] = useState(1)
+  const [maxTokens, setMaxTokens] = useState(1200)
+  const [maxAudioLengthMs, setMaxAudioLengthMs] = useState("")
+  const [responseFormat, setResponseFormat] = useState<ResponseFormat>("mp3")
+  const language = "English-detected"
 
   const audioRef = useRef<HTMLAudioElement | null>(null)
 
-  // Helper function to check if the model is a Marvis model
-  const isMarvisModel = (modelName: string) => {
-    return modelName.toLowerCase().includes("marvis")
-  }
+  const model = resolveTTSModel(baseModel, quantization, customModel)
+  const modelReady = model.length > 0
 
-  // Helper function to get available quantizations for a model
-  const getAvailableQuantizations = (modelName: string) => {
-    if (modelName === "Marvis-AI/marvis-tts-100m-v0.2") {
-      return ["none", "6bit", "8bit"]
-    } else if (modelName === "Marvis-AI/marvis-tts-250m-v0.2") {
-      return ["none", "4bit", "6bit", "8bit"]
-    } else if (modelName === "Marvis-AI/marvis-tts-250m-v0.1") {
-      return ["none", "4bit", "8bit"]
+  const applyModelDefaults = (modelName: string) => {
+    const defaultVoice = getDefaultVoiceForModel(modelName)
+    setSelectedVoice(defaultVoice || "")
+    setVoiceMatch(getDefaultVoiceMatchForModel(modelName))
+    if (isMisoModel(modelName)) {
+      setTemperature(0.9)
+      setTopP(0)
+      setTopK(50)
+    } else {
+      setTemperature(0.7)
+      setTopP(0.95)
+      setTopK(40)
     }
-    return []
-  }
-
-  // Helper function to construct the full model name
-  const getFullModelName = () => {
-    if (isMarvisModel(baseModel) && quantization !== "none") {
-      return `${baseModel}-MLX-${quantization}`
-    }
-    return baseModel
-  }
-
-  // Get the current full model name
-  const model = getFullModelName()
-
-  const handleTextChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    setText(e.target.value)
   }
 
   const handleModelChange = (newModel: string) => {
     setBaseModel(newModel)
-    // Set default quantization based on available options
     if (isMarvisModel(newModel)) {
       const availableQuants = getAvailableQuantizations(newModel)
       if (availableQuants.includes("6bit")) {
@@ -109,12 +76,11 @@ export default function SpeechSynthesis() {
         setQuantization(availableQuants[0])
       }
     }
+    applyModelDefaults(newModel === CUSTOM_TTS_MODEL_VALUE ? customModel : newModel)
   }
 
   const handlePlayPause = () => {
     if (!audioRef.current || !audioRef.current.src || audioRef.current.src === window.location.href) {
-      // If no audio is loaded, or src is not a valid audio source, try to generate first.
-      // This can happen if the user clicks play before generating or after an error.
       handleGenerate()
       return
     }
@@ -128,13 +94,15 @@ export default function SpeechSynthesis() {
   }
 
   const handleGenerate = async () => {
-    if (!audioRef.current) return
+    if (!audioRef.current || !modelReady) return
     setIsGenerating(true)
 
     const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost';
     const API_PORT = process.env.NEXT_PUBLIC_API_PORT || '8000';
 
-    const voice = (model.includes("marvis") ? "conversational_a" : "af_heart");
+    const parsedMaxAudioLengthMs = maxAudioLengthMs.trim()
+      ? Number.parseInt(maxAudioLengthMs, 10)
+      : undefined
 
     try {
       const response = await fetch(`${API_BASE_URL}:${API_PORT}/v1/audio/speech`, {
@@ -142,13 +110,29 @@ export default function SpeechSynthesis() {
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-          model: model, // Or the specific model identifier if different
-          input: text,
-          voice: voice,
-          speed: speed,
-          // pitch and other parameters can be added here if supported by the backend
-        }),
+        body: JSON.stringify(
+          buildTTSRequestPayload({
+            model,
+            input: text,
+            voice: selectedVoice,
+            speed,
+            pitch,
+            gender,
+            speaker,
+            voiceMatch,
+            refAudio,
+            refText,
+            temperature,
+            topP,
+            topK,
+            repetitionPenalty,
+            maxTokens,
+            maxAudioLengthMs: Number.isFinite(parsedMaxAudioLengthMs)
+              ? parsedMaxAudioLengthMs
+              : undefined,
+            responseFormat,
+          })
+        ),
       })
 
       if (!response.ok) {
@@ -162,8 +146,10 @@ export default function SpeechSynthesis() {
       audioRef.current.onloadedmetadata = () => {
         setDuration(formatTime(Math.floor(audioRef.current?.duration || 0)))
         setCurrentTime("00:00")
-        setIsPlaying(true)
-        audioRef.current?.play()
+        audioRef.current
+          ?.play()
+          .then(() => setIsPlaying(true))
+          .catch(() => setIsPlaying(false))
       }
 
       audioRef.current.ontimeupdate = () => {
@@ -173,21 +159,18 @@ export default function SpeechSynthesis() {
       audioRef.current.onended = () => {
         setIsPlaying(false)
         setCurrentTime("00:00")
-         // Revoke the object URL to free up resources
         if (audioRef.current?.src.startsWith("blob:")) {
           URL.revokeObjectURL(audioRef.current.src)
         }
       }
     } catch (error) {
       console.error("Error generating speech:", error)
-      // Handle error appropriately in the UI
     } finally {
       setIsGenerating(false)
     }
   }
 
   const handleDownload = () => {
-    // In a real app, this would download the audio file
     alert("Downloading audio...")
   }
 
@@ -195,28 +178,19 @@ export default function SpeechSynthesis() {
     setLiked(isPositive)
   }
 
-  const getCharacterCount = () => {
-    return text.length
-  }
-
   const formatTime = (seconds: number) => {
     return `00:${seconds.toString().padStart(2, "0")}`
-  }
-
-  const handleVoiceChange = (voice: string) => {
-    setSelectedVoice(voice)
   }
 
   return (
     <LayoutWrapper activeTab="audio" activePage="text-to-speech">
       <div className="flex flex-1 overflow-hidden">
-        {/* Text Input Area */}
         <div className="flex-1 overflow-auto border-r border-gray-200 dark:border-gray-700 p-6">
           <h1 className="mb-6 text-2xl font-bold">Speech Synthesis</h1>
           <textarea
             className="min-h-[200px] w-full resize-none rounded-md border border-gray-200 dark:border-gray-700 p-4 text-gray-700 dark:text-gray-200 bg-white dark:bg-gray-800 focus:border-blue-500 focus:outline-none"
             value={text}
-            onChange={handleTextChange}
+            onChange={(e) => setText(e.target.value)}
             placeholder="Enter text to convert to speech..."
           />
           <div className="mt-auto flex items-center justify-between pt-4 text-xs text-gray-500 dark:text-gray-400">
@@ -225,7 +199,7 @@ export default function SpeechSynthesis() {
               <div className="h-2 w-2 rounded-full bg-gray-400 dark:bg-gray-500"></div>
             </div>
             <div className="flex items-center space-x-2">
-              <span>{getCharacterCount()} / 5,000 characters</span>
+              <span>{text.length} / 5,000 characters</span>
               <div className="h-2 w-2 rounded-full bg-gray-200 dark:bg-gray-600"></div>
             </div>
           </div>
@@ -246,9 +220,9 @@ export default function SpeechSynthesis() {
             </div>
             <div className="flex items-center space-x-2">
               <button
-                className={`rounded-md bg-sky-500 dark:bg-sky-600 px-3 py-1 text-sm text-white flex items-center hover:bg-sky-600 dark:hover:bg-sky-700 ${isGenerating ? "animate-pulse" : ""}`}
+                className={`rounded-md bg-sky-500 dark:bg-sky-600 px-3 py-1 text-sm text-white flex items-center hover:bg-sky-600 dark:hover:bg-sky-700 disabled:cursor-not-allowed disabled:opacity-50 ${isGenerating ? "animate-pulse" : ""}`}
                 onClick={handleGenerate}
-                disabled={isGenerating}
+                disabled={isGenerating || !modelReady}
               >
                 {isGenerating ? (
                   <>
@@ -266,7 +240,6 @@ export default function SpeechSynthesis() {
           </div>
         </div>
 
-        {/* Settings Panel */}
         <div className="w-80 overflow-auto p-4 bg-white dark:bg-gray-900">
           <div className="mb-4 flex space-x-4 border-b border-gray-200 dark:border-gray-700 pb-2">
             <button
@@ -294,16 +267,34 @@ export default function SpeechSynthesis() {
                       value={baseModel}
                       onChange={(e) => handleModelChange(e.target.value)}
                     >
-                      <option value="Marvis-AI/marvis-tts-100m-v0.2">Marvis-TTS-100m-v0.2</option>
-                      <option value="Marvis-AI/marvis-tts-250m-v0.2">Marvis-TTS-250m-v0.2</option>
-                      <option value="Marvis-AI/marvis-tts-250m-v0.1">Marvis-TTS-250m-v0.1</option>
-                      <option value="mlx-community/Kokoro-82M-bf16">Kokoro</option>
-                      <option value="mlx-community/Spark-TTS-0.5B-bf16">SparkTTS</option>
+                      {TTS_MODEL_PRESETS.map((preset) => (
+                        <option key={preset.value} value={preset.value}>
+                          {preset.label}
+                        </option>
+                      ))}
                     </select>
                     <ChevronDown className="absolute right-2 top-2 h-4 w-4 pointer-events-none" />
                   </div>
                 </div>
               </div>
+
+              {isCustomModelSelection(baseModel) && (
+                <div className="mb-6">
+                  <label className="mb-2 block text-sm" htmlFor="custom-tts-model">
+                    Model path or repo
+                  </label>
+                  <input
+                    id="custom-tts-model"
+                    className="w-full rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 px-2 py-1 text-sm"
+                    value={customModel}
+                    onChange={(e) => {
+                      setCustomModel(e.target.value)
+                      applyModelDefaults(e.target.value)
+                    }}
+                    placeholder="mlx-community/MisoTTS-8bit or a local model folder"
+                  />
+                </div>
+              )}
 
               {isMarvisModel(baseModel) && (
                 <div className="mb-6">
@@ -329,11 +320,87 @@ export default function SpeechSynthesis() {
 
               <div className="mb-6">
                 <div className="text-xs text-gray-500 dark:text-gray-400">
-                  <span className="font-medium">Selected Model:</span> <span className="font-mono">{model}</span>
+                  <span className="font-medium">Selected Model:</span> <span className="font-mono break-all">{model || "None"}</span>
                 </div>
               </div>
 
+              <div className="mb-6">
+                <label className="mb-2 block text-sm" htmlFor="tts-voice">
+                  Voice
+                </label>
+                <input
+                  id="tts-voice"
+                  className="w-full rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 px-2 py-1 text-sm"
+                  value={selectedVoice}
+                  onChange={(e) => setSelectedVoice(e.target.value)}
+                  placeholder={getDefaultVoiceForModel(model) || "Default"}
+                />
+              </div>
 
+              <div className="mb-6 grid grid-cols-2 gap-3">
+                <label className="block text-sm" htmlFor="tts-speaker">
+                  Speaker
+                  <input
+                    id="tts-speaker"
+                    type="number"
+                    min={0}
+                    step={1}
+                    className="mt-2 w-full rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 px-2 py-1 text-sm"
+                    value={speaker}
+                    onChange={(e) => setSpeaker(Number.parseInt(e.target.value, 10) || 0)}
+                  />
+                </label>
+                <label className="block text-sm" htmlFor="tts-gender">
+                  Gender
+                  <select
+                    id="tts-gender"
+                    className="mt-2 w-full rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 px-2 py-1 text-sm"
+                    value={gender}
+                    onChange={(e) => setGender(e.target.value)}
+                  >
+                    <option value="male">Male</option>
+                    <option value="female">Female</option>
+                  </select>
+                </label>
+              </div>
+
+              <div className="mb-6 flex items-center justify-between">
+                <label className="text-sm" htmlFor="tts-voice-match">
+                  Voice match
+                </label>
+                <input
+                  id="tts-voice-match"
+                  type="checkbox"
+                  className="h-4 w-4"
+                  checked={voiceMatch}
+                  onChange={(e) => setVoiceMatch(e.target.checked)}
+                />
+              </div>
+
+              <div className="mb-6">
+                <label className="mb-2 block text-sm" htmlFor="tts-ref-audio">
+                  Reference audio
+                </label>
+                <input
+                  id="tts-ref-audio"
+                  className="w-full rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 px-2 py-1 text-sm"
+                  value={refAudio}
+                  onChange={(e) => setRefAudio(e.target.value)}
+                  placeholder="/path/to/reference.wav"
+                />
+              </div>
+
+              <div className="mb-6">
+                <label className="mb-2 block text-sm" htmlFor="tts-ref-text">
+                  Reference text
+                </label>
+                <textarea
+                  id="tts-ref-text"
+                  className="min-h-20 w-full resize-none rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 px-2 py-1 text-sm"
+                  value={refText}
+                  onChange={(e) => setRefText(e.target.value)}
+                />
+              </div>
 
               <div className="mb-6">
                 <div className="mb-2 flex items-center justify-between">
@@ -382,80 +449,137 @@ export default function SpeechSynthesis() {
                   <div className="flex items-center">
                     <div className="flex space-x-2 mr-2">
                       <button
-                        onClick={() => setPitch(-5)}
-                        className={`px-2 py-0.5 text-xs rounded-md ${pitch === -5 ? "bg-sky-100 dark:bg-sky-900 text-sky-600 dark:text-sky-300" : "bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300"}`}
+                        onClick={() => setPitch(0.8)}
+                        className={`px-2 py-0.5 text-xs rounded-md ${pitch === 0.8 ? "bg-sky-100 dark:bg-sky-900 text-sky-600 dark:text-sky-300" : "bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300"}`}
                       >
                         Low
                       </button>
                       <button
-                        onClick={() => setPitch(0)}
-                        className={`px-2 py-0.5 text-xs rounded-md ${pitch === 0 ? "bg-sky-100 dark:bg-sky-900 text-sky-600 dark:text-sky-300" : "bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300"}`}
+                        onClick={() => setPitch(1)}
+                        className={`px-2 py-0.5 text-xs rounded-md ${pitch === 1 ? "bg-sky-100 dark:bg-sky-900 text-sky-600 dark:text-sky-300" : "bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300"}`}
                       >
                         Normal
                       </button>
                       <button
-                        onClick={() => setPitch(5)}
-                        className={`px-2 py-0.5 text-xs rounded-md ${pitch === 5 ? "bg-sky-100 dark:bg-sky-900 text-sky-600 dark:text-sky-300" : "bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300"}`}
+                        onClick={() => setPitch(1.2)}
+                        className={`px-2 py-0.5 text-xs rounded-md ${pitch === 1.2 ? "bg-sky-100 dark:bg-sky-900 text-sky-600 dark:text-sky-300" : "bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300"}`}
                       >
                         High
                       </button>
                     </div>
-                    <span className="text-sm font-medium">{pitch}</span>
+                    <span className="text-sm font-medium">{pitch.toFixed(1)}x</span>
                   </div>
                 </div>
                 <div className="flex items-center">
-                  <span className="text-xs text-gray-500 mr-2">-10</span>
+                  <span className="text-xs text-gray-500 mr-2">Low</span>
                   <RangeInput
-                    min={-10}
-                    max={10}
-                    step={1}
+                    min={0.5}
+                    max={2}
+                    step={0.1}
                     value={pitch}
-                    onChange={(e) => setPitch(Number.parseInt(e.target.value))}
+                    onChange={(e) => setPitch(Number.parseFloat(e.target.value))}
                     ariaLabel="Pitch control"
                   />
-                  <span className="text-xs text-gray-500 ml-2">+10</span>
+                  <span className="text-xs text-gray-500 ml-2">High</span>
                 </div>
               </div>
 
-              <div className="mb-4">
-                <div className="mb-2 flex items-center justify-between">
-                  <span className="text-sm">Volume</span>
-                  <div className="flex items-center">
-                    <div className="flex space-x-2 mr-2">
-                      <button
-                        onClick={() => setVolume(0.5)}
-                        className={`px-2 py-0.5 text-xs rounded-md ${volume === 0.5 ? "bg-sky-100 dark:bg-sky-900 text-sky-600 dark:text-sky-300" : "bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300"}`}
-                      >
-                        Quiet
-                      </button>
-                      <button
-                        onClick={() => setVolume(1)}
-                        className={`px-2 py-0.5 text-xs rounded-md ${volume === 1 ? "bg-sky-100 dark:bg-sky-900 text-sky-600 dark:text-sky-300" : "bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300"}`}
-                      >
-                        Normal
-                      </button>
-                      <button
-                        onClick={() => setVolume(1.5)}
-                        className={`px-2 py-0.5 text-xs rounded-md ${volume === 1.5 ? "bg-sky-100 dark:bg-sky-900 text-sky-600 dark:text-sky-300" : "bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300"}`}
-                      >
-                        Loud
-                      </button>
-                    </div>
-                    <span className="text-sm font-medium">{volume}x</span>
-                  </div>
-                </div>
-                <div className="flex items-center">
-                  <span className="text-xs text-gray-500 mr-2">0</span>
-                  <RangeInput
+              <div className="mb-6 grid grid-cols-2 gap-3">
+                <label className="block text-sm" htmlFor="tts-temperature">
+                  Temperature
+                  <input
+                    id="tts-temperature"
+                    type="number"
                     min={0}
                     max={2}
-                    step={0.1}
-                    value={volume}
-                    onChange={(e) => setVolume(Number.parseFloat(e.target.value))}
-                    ariaLabel="Volume control"
+                    step={0.05}
+                    className="mt-2 w-full rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 px-2 py-1 text-sm"
+                    value={temperature}
+                    onChange={(e) => setTemperature(Number.parseFloat(e.target.value))}
                   />
-                  <span className="text-xs text-gray-500 ml-2">2</span>
-                </div>
+                </label>
+                <label className="block text-sm" htmlFor="tts-top-p">
+                  Top P
+                  <input
+                    id="tts-top-p"
+                    type="number"
+                    min={0}
+                    max={1}
+                    step={0.05}
+                    className="mt-2 w-full rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 px-2 py-1 text-sm"
+                    value={topP}
+                    onChange={(e) => setTopP(Number.parseFloat(e.target.value))}
+                  />
+                </label>
+                <label className="block text-sm" htmlFor="tts-top-k">
+                  Top K
+                  <input
+                    id="tts-top-k"
+                    type="number"
+                    min={0}
+                    step={1}
+                    className="mt-2 w-full rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 px-2 py-1 text-sm"
+                    value={topK}
+                    onChange={(e) => setTopK(Number.parseInt(e.target.value, 10) || 0)}
+                  />
+                </label>
+                <label className="block text-sm" htmlFor="tts-repetition-penalty">
+                  Repetition
+                  <input
+                    id="tts-repetition-penalty"
+                    type="number"
+                    min={0}
+                    step={0.05}
+                    className="mt-2 w-full rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 px-2 py-1 text-sm"
+                    value={repetitionPenalty}
+                    onChange={(e) => setRepetitionPenalty(Number.parseFloat(e.target.value))}
+                  />
+                </label>
+              </div>
+
+              <div className="mb-6 grid grid-cols-2 gap-3">
+                <label className="block text-sm" htmlFor="tts-max-tokens">
+                  Max tokens
+                  <input
+                    id="tts-max-tokens"
+                    type="number"
+                    min={1}
+                    step={1}
+                    className="mt-2 w-full rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 px-2 py-1 text-sm"
+                    value={maxTokens}
+                    onChange={(e) => setMaxTokens(Number.parseInt(e.target.value, 10) || 1)}
+                  />
+                </label>
+                <label className="block text-sm" htmlFor="tts-max-audio-ms">
+                  Max audio ms
+                  <input
+                    id="tts-max-audio-ms"
+                    type="number"
+                    min={80}
+                    step={80}
+                    className="mt-2 w-full rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 px-2 py-1 text-sm"
+                    value={maxAudioLengthMs}
+                    onChange={(e) => setMaxAudioLengthMs(e.target.value)}
+                  />
+                </label>
+              </div>
+
+              <div className="mb-4">
+                <label className="mb-2 block text-sm" htmlFor="tts-response-format">
+                  Format
+                </label>
+                <select
+                  id="tts-response-format"
+                  className="w-full rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 px-2 py-1 text-sm"
+                  value={responseFormat}
+                  onChange={(e) => setResponseFormat(e.target.value as ResponseFormat)}
+                >
+                  <option value="mp3">MP3</option>
+                  <option value="wav">WAV</option>
+                  <option value="flac">FLAC</option>
+                  <option value="ogg">OGG</option>
+                  <option value="opus">Opus</option>
+                </select>
               </div>
             </>
           ) : (
@@ -466,7 +590,6 @@ export default function SpeechSynthesis() {
         </div>
       </div>
 
-      {/* Audio Player */}
       <div className="border-t border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 w-full">
         <div className="flex items-center w-full px-0">
           <button
@@ -479,7 +602,7 @@ export default function SpeechSynthesis() {
           <div className="flex flex-col justify-between h-full flex-1 px-4 py-2">
             <div className="flex items-center justify-between w-full">
               <div className="text-sm">
-                {selectedVoice}: {text.length > 20 ? text.substring(0, 20) + "..." : text}
+                {selectedVoice || "Default"}: {text.length > 20 ? text.substring(0, 20) + "..." : text}
               </div>
               <div className="flex items-center space-x-2">
                 <div className="text-xs text-gray-500 dark:text-gray-400 mr-2">How did this sound?</div>
@@ -537,7 +660,6 @@ export default function SpeechSynthesis() {
         </div>
       </div>
 
-      {/* Hidden audio element for actual implementation */}
       <audio ref={audioRef} className="hidden" />
     </LayoutWrapper>
   )

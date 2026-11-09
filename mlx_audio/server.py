@@ -13,6 +13,7 @@ import io
 import json
 import os
 import subprocess
+import threading
 import time
 import uuid
 import webbrowser
@@ -91,25 +92,31 @@ def sanitize_for_json(obj: Any) -> Any:
 
 class ModelProvider:
     def __init__(self):
-        self.models: Dict[str, Dict[str, Any]] = {}
+        self.models: Dict[str, Dict[int, Any]] = {}
+        self._models_lock = threading.RLock()
         self.lock = asyncio.Lock()
 
     def load_model(self, model_name: str):
-        if model_name not in self.models:
-            self.models[model_name] = load_model(model_name)
+        thread_id = threading.get_ident()
+        with self._models_lock:
+            thread_models = self.models.get(model_name)
+            if thread_models is not None and thread_id in thread_models:
+                return thread_models[thread_id]
 
-        return self.models[model_name]
+        model = load_model(model_name)
+        with self._models_lock:
+            thread_models = self.models.setdefault(model_name, {})
+            return thread_models.setdefault(thread_id, model)
 
     async def remove_model(self, model_name: str) -> bool:
         async with self.lock:
-            if model_name in self.models:
-                del self.models[model_name]
-                return True
-            return False
+            with self._models_lock:
+                return self.models.pop(model_name, None) is not None
 
     async def get_available_models(self):
         async with self.lock:
-            return list(self.models.keys())
+            with self._models_lock:
+                return list(self.models.keys())
 
 
 app = FastAPI()
@@ -169,12 +176,14 @@ class SpeechRequest(BaseModel):
     input: str
     instruct: str | None = None
     voice: str | None = None
+    speaker: int | None = None
     speed: float | None = 1.0
     gender: str | None = "male"
     pitch: float | None = 1.0
     lang_code: str | None = "a"
     ref_audio: str | None = None
     ref_text: str | None = None
+    voice_match: bool | None = None
     temperature: float | None = 0.7
     top_p: float | None = 0.95
     top_k: int | None = 40
@@ -183,6 +192,7 @@ class SpeechRequest(BaseModel):
     stream: bool = False
     streaming_interval: float = 2.0
     max_tokens: int = 1200
+    max_audio_length_ms: int | None = None
     verbose: bool = False
 
 
@@ -241,16 +251,21 @@ def _load_model_for_inference(model_name: str):
 
 
 async def _preflight_model_load(model_name: str) -> None:
-    """Load ``model_name`` synchronously and translate failures into HTTPException.
+    """Load ``model_name`` in the inference worker before streaming starts.
 
     Routes that return a ``StreamingResponse`` commit the HTTP status + headers
     before the body generator runs, so any failure inside the inference worker
-    surfaces as 200 OK with an empty body. Pre-flighting the load here lets the
-    framework's exception handlers turn the failure into a real HTTP error
-    response. Warm models are a no-op (``ModelProvider.load_model`` is cached).
+    surfaces as 200 OK with an empty body. Pre-flighting the load through the
+    inference broker lets FastAPI return a real HTTP error response while also
+    keeping MLX models owned by the same worker thread that later generates.
     """
     try:
-        await asyncio.to_thread(_load_model_for_inference, model_name)
+        handle = get_inference_broker().submit(
+            endpoint_kind="model-load",
+            model_name=model_name,
+            payload=None,
+        )
+        await _await_inference_result(handle)
     except HTTPException:
         raise
     except RepositoryNotFoundError as exc:
@@ -266,6 +281,12 @@ async def _preflight_model_load(model_name: str) -> None:
 
 
 _STT_EXTRA_KWARGS = {"word_timestamps", "timestamp_granularities"}
+
+
+class ModelLoadExecutionAdapter(BaseModelExecutionAdapter):
+    def run_serial(self, request: InferenceRequest) -> None:
+        _load_model_for_inference(request.model_name)
+        request.emit_done()
 
 
 class STTExecutionAdapter(BaseModelExecutionAdapter):
@@ -422,6 +443,12 @@ class _TTSAdapterContinuousSession:
 
 class TTSExecutionAdapter(BaseModelExecutionAdapter):
     _REQUEST_MODEL_ATTR = "_mlx_audio_loaded_model"
+    _MISO_SAMPLING_FIELDS = {
+        "temperature",
+        "top_p",
+        "top_k",
+        "repetition_penalty",
+    }
 
     def __init__(self):
         raw_max_batch_size = os.getenv("MLX_AUDIO_TTS_MAX_BATCH_SIZE", "8")
@@ -467,6 +494,12 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
             return None
         return value
 
+    def _is_miso_model(self, model) -> bool:
+        if getattr(model, "model_type", None) == "miso_tts":
+            return True
+        model_args = getattr(getattr(model, "model", None), "args", None)
+        return getattr(model_args, "model_type", None) == "miso_tts"
+
     def _model_supports_request(
         self,
         model,
@@ -485,6 +518,12 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
         if speech_request.stream:
             return False
         if speech_request.ref_audio or speech_request.ref_text:
+            return False
+        if speech_request.speaker not in (None, 0):
+            return False
+        if speech_request.voice_match is not None:
+            return False
+        if speech_request.max_audio_length_ms is not None:
             return False
         if speech_request.gender not in (None, "male"):
             return False
@@ -509,7 +548,11 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
         params = signature.parameters
         if "texts" not in params:
             return False
+        if speech_request.speaker not in (None, 0) and "speakers" not in params:
+            return False
         if speech_request.voice and "voices" not in params:
+            return False
+        if speech_request.voice_match is not None and "voice_matches" not in params:
             return False
         if speech_request.instruct and "instructs" not in params:
             return False
@@ -553,6 +596,9 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
             speech_request.top_k,
             speech_request.repetition_penalty,
             speech_request.max_tokens,
+            speech_request.max_audio_length_ms,
+            speech_request.speaker,
+            speech_request.voice_match,
             speech_request.ref_audio,
             speech_request.ref_text,
             speech_request.streaming_interval if speech_request.stream else None,
@@ -618,6 +664,7 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
         sample_rate = None
         generate_kwargs = {
             "voice": speech_request.voice,
+            "speaker": speech_request.speaker,
             "speed": speech_request.speed,
             "gender": speech_request.gender,
             "pitch": speech_request.pitch,
@@ -625,6 +672,7 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
             "lang_code": speech_request.lang_code,
             "ref_audio": ref_audio,
             "ref_text": speech_request.ref_text,
+            "voice_match": speech_request.voice_match,
             "temperature": speech_request.temperature,
             "top_p": speech_request.top_p,
             "top_k": speech_request.top_k,
@@ -632,8 +680,21 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
             "stream": speech_request.stream,
             "streaming_interval": speech_request.streaming_interval,
             "max_tokens": speech_request.max_tokens,
+            "max_audio_length_ms": speech_request.max_audio_length_ms,
             "verbose": speech_request.verbose,
         }
+        if self._is_miso_model(model):
+            explicit_fields = getattr(speech_request, "model_fields_set", set())
+            for field in self._MISO_SAMPLING_FIELDS:
+                if field not in explicit_fields:
+                    generate_kwargs.pop(field, None)
+
+            max_tokens = generate_kwargs.pop("max_tokens", None)
+            if (
+                max_tokens is not None
+                and generate_kwargs.get("max_audio_length_ms") is None
+            ):
+                generate_kwargs["max_audio_length_ms"] = int(max_tokens) * 80
 
         for result in model.generate(speech_request.input, **generate_kwargs):
             if request.cancel_event.is_set():
@@ -679,7 +740,9 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
 
         first_speech_request: SpeechRequest = requests[0].payload.request
         texts = [request.payload.request.input for request in requests]
+        speakers = [request.payload.request.speaker for request in requests]
         voices = [request.payload.request.voice for request in requests]
+        voice_matches = [request.payload.request.voice_match for request in requests]
         instructs = [request.payload.request.instruct for request in requests]
         speeds = [request.payload.request.speed for request in requests]
         genders = [request.payload.request.gender for request in requests]
@@ -696,7 +759,9 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
         signature = inspect.signature(batch_generate)
         kwargs = {
             "texts": texts,
+            "speakers": speakers,
             "voices": voices,
+            "voice_matches": voice_matches,
             "instructs": instructs,
             "speeds": speeds,
             "genders": genders,
@@ -824,6 +889,7 @@ def get_inference_broker() -> InferenceBroker:
     global INFERENCE_BROKER
     if INFERENCE_BROKER is None:
         broker = InferenceBroker()
+        broker.register_adapter("model-load", ModelLoadExecutionAdapter())
         broker.register_adapter("stt", STTExecutionAdapter())
         broker.register_adapter("tts", TTSExecutionAdapter())
         broker.register_adapter("separation", SeparationExecutionAdapter())

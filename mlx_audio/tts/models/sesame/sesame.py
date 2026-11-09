@@ -33,6 +33,11 @@ except ImportError:
 
 MIMI_REPO = "kyutai/moshiko-pytorch-bf16"
 TOKENIZER_REPO = "unsloth/Llama-3.2-1B"
+DEFAULT_SPEAKER_PROMPT_REPO = "sesame/csm-1b"
+GATED_LLAMA_TOKENIZER_REPOS = {"meta-llama/Llama-3.2-1B"}
+MISO_MODEL_TYPE = "miso_tts"
+MISO_DEFAULT_TEMPERATURE = 0.9
+MISO_DEFAULT_TOP_K = 50
 
 
 @dataclass
@@ -447,6 +452,20 @@ def load_llama3_tokenizer(path_or_hf_repo: str):
     return tokenizer
 
 
+def resolve_text_tokenizer_repo(config: Dict) -> Optional[str]:
+    tokenizer_repo = config.get("text_tokenizer")
+    if (
+        config.get("model_type") == MISO_MODEL_TYPE
+        and tokenizer_repo in GATED_LLAMA_TOKENIZER_REPOS
+    ):
+        return TOKENIZER_REPO
+    return tokenizer_repo
+
+
+def _bool_config(config: Dict, key: str, default: bool) -> bool:
+    return bool(config[key]) if key in config else default
+
+
 class Model(nn.Module):
     def __init__(
         self,
@@ -455,19 +474,33 @@ class Model(nn.Module):
         super().__init__()
         self.model = SesameModel(config)
         self.model.setup_caches(1)
+        self.model_type = config.get("model_type")
         self._frame_size = self.model.args.audio_num_codebooks + 1
-        self._speaker_prefix_space = bool(config.get("speaker_prefix_space", False))
+        is_miso = self.model_type == MISO_MODEL_TYPE
+        self._speaker_prefix_space = _bool_config(
+            config, "speaker_prefix_space", is_miso
+        )
         self._watermark_key = config.get(
             "watermark_key", globals().get("CSM_1B_GH_WATERMARK")
         )
-        self._use_default_voice_prompt = bool(
-            config.get("use_default_voice_prompt", True)
+        self._use_default_voice_prompt = _bool_config(
+            config, "use_default_voice_prompt", not is_miso
         )
-        self._default_voice_match = bool(config.get("voice_match", True))
+        self._default_voice_match = _bool_config(
+            config, "voice_match", not is_miso
+        )
 
-        self.tokenizer_repo = config.get("text_tokenizer")
+        self.tokenizer_repo = resolve_text_tokenizer_repo(config)
+        self._default_voice_prompt_repo = config.get(
+            "default_voice_prompt_repo", DEFAULT_SPEAKER_PROMPT_REPO
+        )
         if self.tokenizer_repo:
-            self._text_tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_repo)
+            if config.get("text_tokenizer_apply_template", False):
+                self._text_tokenizer = load_llama3_tokenizer(self.tokenizer_repo)
+            else:
+                self._text_tokenizer = AutoTokenizer.from_pretrained(
+                    self.tokenizer_repo
+                )
         else:
             self._text_tokenizer = load_llama3_tokenizer(TOKENIZER_REPO)
 
@@ -736,6 +769,10 @@ class Model(nn.Module):
         split_pattern: Optional[str] = r"\n+",
         sampler: Callable[..., mx.array] = None,
         max_audio_length_ms: float = 90_000,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
         ref_audio: Optional[Union[str, mx.array]] = None,
         ref_text: str = None,
         stream: bool = False,
@@ -758,13 +795,18 @@ class Model(nn.Module):
             if voice is None:
                 voice = "conversational_a"
             context = self.default_speaker_prompt(
-                voice,
-                repo_id=(
-                    "sesame/csm-1b" if not self.tokenizer_repo else self.tokenizer_repo
-                ),
+                voice, repo_id=self._default_voice_prompt_repo
             )
 
-        sampler = sampler or make_sampler(temp=0.9, top_k=50)
+        if max_tokens is not None:
+            max_audio_length_ms = int(max_tokens) * 80
+
+        if sampler is None:
+            sampler = make_sampler(
+                temp=MISO_DEFAULT_TEMPERATURE if temperature is None else temperature,
+                top_p=0.0 if top_p is None else top_p,
+                top_k=MISO_DEFAULT_TOP_K if top_k is None else top_k,
+            )
         max_audio_frames = int(max_audio_length_ms / 80)
         streaming_interval_tokens = int(streaming_interval * 12.5)
 

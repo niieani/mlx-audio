@@ -3,6 +3,7 @@ import importlib.util
 import json
 import threading
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import MethodType, SimpleNamespace
@@ -5457,6 +5458,169 @@ class TestMossTTSRegistration(unittest.TestCase):
 
 
 class TestMisoTTSRegistration(unittest.TestCase):
+    def _fake_model_patches(self, sesame, tokenizer):
+        class FakeSesameModel:
+            def __init__(self, config):
+                self.args = SimpleNamespace(
+                    audio_num_codebooks=config["audio_num_codebooks"]
+                )
+
+            def setup_caches(self, max_batch_size):
+                self.max_batch_size = max_batch_size
+
+            def reset_caches(self):
+                pass
+
+            def generate_frame(self, tokens, tokens_mask, input_pos, sampler):
+                return mx.zeros((1, self.args.audio_num_codebooks), dtype=mx.int32)
+
+        class FakeMimi:
+            cfg = SimpleNamespace(sample_rate=24000)
+
+            def eval(self):
+                return None
+
+            def encode(self, audio):
+                return mx.array([[[1, 2], [3, 4], [5, 6]]])
+
+        return (
+            patch("mlx_audio.tts.models.sesame.sesame.SesameModel", FakeSesameModel),
+            patch(
+                "mlx_audio.tts.models.sesame.sesame.load_llama3_tokenizer",
+                return_value=tokenizer,
+            ),
+            patch(
+                "mlx_audio.tts.models.sesame.sesame.Mimi.from_pretrained",
+                return_value=FakeMimi(),
+            ),
+            patch(
+                "mlx_audio.tts.models.sesame.sesame.MimiStreamingDecoder",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "mlx_audio.tts.models.sesame.sesame.load_watermarker",
+                side_effect=RuntimeError,
+                create=True,
+            ),
+        )
+
+    def _miso_config(self):
+        return {
+            "model_type": "miso_tts",
+            "audio_num_codebooks": 3,
+            "text_tokenizer": "meta-llama/Llama-3.2-1B",
+            "text_tokenizer_apply_template": True,
+        }
+
+    def test_miso_tts_model_type_maps_to_sesame(self):
+        from mlx_audio.tts.utils import MODEL_REMAPPING
+
+        self.assertEqual(MODEL_REMAPPING["miso_tts"], "sesame")
+
+    def test_miso_tts_model_type_resolves_sesame_architecture(self):
+        from mlx_audio.tts.models.sesame import Model as SesameModel
+        from mlx_audio.tts.utils import MODEL_REMAPPING
+        from mlx_audio.utils import get_model_class
+
+        arch, model_type = get_model_class(
+            model_type="miso_tts",
+            model_name=["misotts", "8bit"],
+            category="tts",
+            model_remapping=MODEL_REMAPPING,
+        )
+
+        self.assertEqual(model_type, "sesame")
+        self.assertIs(arch.Model, SesameModel)
+
+    def test_miso_uses_public_tokenizer_when_config_points_to_gated_meta_repo(self):
+        from mlx_audio.tts.models.sesame import sesame
+
+        class FakeTokenizer:
+            def encode(self, text, return_tensors=None):
+                return mx.array([[7, 8]])
+
+        tokenizer = FakeTokenizer()
+        with ExitStack() as stack:
+            for patch_context in self._fake_model_patches(sesame, tokenizer):
+                stack.enter_context(patch_context)
+            stack.enter_context(
+                patch(
+                    "mlx_audio.tts.models.sesame.sesame.AutoTokenizer.from_pretrained",
+                    side_effect=AssertionError(
+                        "gated tokenizer should not be requested"
+                    ),
+                )
+            )
+            model = sesame.Model(self._miso_config())
+
+        self.assertIs(model._text_tokenizer, tokenizer)
+
+    def test_miso_defaults_follow_upstream_promptless_generation(self):
+        from mlx_audio.tts.models.sesame import sesame
+
+        encoded_text = []
+
+        class FakeTokenizer:
+            def encode(self, text, return_tensors=None):
+                encoded_text.append(text)
+                return mx.array([[7, 8]])
+
+        with ExitStack() as stack:
+            for patch_context in self._fake_model_patches(sesame, FakeTokenizer()):
+                stack.enter_context(patch_context)
+            stack.enter_context(
+                patch(
+                    "mlx_audio.tts.models.sesame.sesame.AutoTokenizer.from_pretrained",
+                    return_value=FakeTokenizer(),
+                )
+            )
+            model = sesame.Model(self._miso_config())
+
+        model.default_speaker_prompt = MagicMock(
+            side_effect=AssertionError("Miso quickstart does not use prompt audio")
+        )
+        list(model.generate("Direct text", max_audio_length_ms=80))
+
+        self.assertTrue(model._speaker_prefix_space)
+        self.assertFalse(model._use_default_voice_prompt)
+        self.assertFalse(model._default_voice_match)
+        model.default_speaker_prompt.assert_not_called()
+        self.assertEqual(encoded_text[-1], "[0] Direct text")
+
+    def test_miso_config_can_opt_back_into_sesame_voice_prompt(self):
+        from mlx_audio.tts.models.sesame import sesame
+
+        class FakeTokenizer:
+            def encode(self, text, return_tensors=None):
+                return mx.array([[7, 8]])
+
+        config = {
+            **self._miso_config(),
+            "speaker_prefix_space": False,
+            "use_default_voice_prompt": True,
+            "voice_match": True,
+        }
+
+        with ExitStack() as stack:
+            for patch_context in self._fake_model_patches(sesame, FakeTokenizer()):
+                stack.enter_context(patch_context)
+            stack.enter_context(
+                patch(
+                    "mlx_audio.tts.models.sesame.sesame.AutoTokenizer.from_pretrained",
+                    return_value=FakeTokenizer(),
+                )
+            )
+            model = sesame.Model(config)
+
+        model.default_speaker_prompt = MagicMock(return_value=[])
+        list(model.generate("Direct text", max_audio_length_ms=80))
+
+        self.assertFalse(model._speaker_prefix_space)
+        self.assertTrue(model._use_default_voice_prompt)
+        self.assertTrue(model._default_voice_match)
+        model.default_speaker_prompt.assert_called_once_with(
+            "conversational_a", repo_id="sesame/csm-1b"
+        )
 
     def test_miso_llama_flavors(self):
         from mlx_audio.tts.models.sesame.sesame import create_llama_model_args

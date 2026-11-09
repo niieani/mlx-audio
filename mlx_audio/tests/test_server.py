@@ -1,5 +1,6 @@
 import functools
 import io
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -90,6 +91,46 @@ def test_remove_model_with_quotes_in_name(client, mock_model_provider):
     response = client.delete('/v1/models?model_name="test_model_quotes"')
     assert response.status_code == 204
     mock_model_provider.remove_model.assert_called_once_with("test_model_quotes")
+
+
+def test_model_provider_keeps_thread_local_model_instances(monkeypatch):
+    from mlx_audio.server import ModelProvider
+
+    def fake_load_model(model_name):
+        return {"model": model_name, "thread": threading.get_ident()}
+
+    monkeypatch.setattr("mlx_audio.server.load_model", fake_load_model)
+    provider = ModelProvider()
+
+    main_model = provider.load_model("threaded-model")
+    assert provider.load_model("threaded-model") is main_model
+
+    worker_models = []
+    thread = threading.Thread(
+        target=lambda: worker_models.append(provider.load_model("threaded-model"))
+    )
+    thread.start()
+    thread.join(timeout=2)
+
+    assert len(worker_models) == 1
+    assert worker_models[0] is not main_model
+    assert worker_models[0]["thread"] != main_model["thread"]
+
+
+def test_model_provider_failed_load_not_listed(monkeypatch):
+    from mlx_audio.server import ModelProvider
+
+    def fake_load_model(model_name):
+        del model_name
+        raise RuntimeError("load failed")
+
+    monkeypatch.setattr("mlx_audio.server.load_model", fake_load_model)
+    provider = ModelProvider()
+
+    with pytest.raises(RuntimeError, match="load failed"):
+        provider.load_model("broken-model")
+
+    assert provider.models == {}
 
 
 class MockAudioResult:
@@ -194,6 +235,150 @@ def test_tts_speech_load_failure_returns_500(client, mock_model_provider):
     body = response.json()
     assert "detail" in body
     assert "some-model" in body["detail"]
+
+
+def test_tts_speech_loads_cached_model_on_inference_thread(
+    client,
+    mock_model_provider,
+):
+    """Regression: TTS preflight must not cache MLX models on another thread."""
+
+    class ThreadBoundTTSModel:
+        def __init__(self):
+            self.load_thread = threading.get_ident()
+            self.generate_thread = None
+
+        def generate(self, input_text: str, **kwargs):
+            del input_text, kwargs
+            self.generate_thread = threading.get_ident()
+            if self.generate_thread != self.load_thread:
+                raise RuntimeError(
+                    "thread-bound model generated on a different thread"
+                )
+            yield MockAudioResult(np.ones(1600, dtype=np.float32), 16000)
+
+    class CachingProvider:
+        def __init__(self):
+            self.models = {}
+
+        def load_model(self, model_name):
+            if model_name not in self.models:
+                self.models[model_name] = ThreadBoundTTSModel()
+            return self.models[model_name]
+
+    provider = CachingProvider()
+    mock_model_provider.load_model = provider.load_model
+
+    payload = {
+        "model": "thread-bound-tts",
+        "input": "Hello world",
+        "response_format": "wav",
+    }
+    response = client.post("/v1/audio/speech", json=payload)
+
+    assert response.status_code == 200
+    model = provider.models["thread-bound-tts"]
+    assert model.generate_thread == model.load_thread
+
+
+def test_tts_speech_miso_uses_model_sampling_defaults_and_audio_length(
+    client,
+    mock_model_provider,
+):
+    class MockMisoModel:
+        model_type = "miso_tts"
+        sample_rate = 16000
+
+        def __init__(self):
+            self.generate_kwargs = None
+
+        def generate(self, input_text: str, **kwargs):
+            del input_text
+            self.generate_kwargs = kwargs
+            yield MockAudioResult(np.ones(1600, dtype=np.float32), self.sample_rate)
+
+    mock_tts_model = MockMisoModel()
+    mock_model_provider.load_model = MagicMock(return_value=mock_tts_model)
+
+    payload = {
+        "model": "mlx-community/MisoTTS-8bit",
+        "input": "Hello world",
+        "response_format": "wav",
+        "max_tokens": 25,
+    }
+    response = client.post("/v1/audio/speech", json=payload)
+
+    assert response.status_code == 200
+    assert mock_tts_model.generate_kwargs is not None
+    assert "temperature" not in mock_tts_model.generate_kwargs
+    assert "top_p" not in mock_tts_model.generate_kwargs
+    assert "top_k" not in mock_tts_model.generate_kwargs
+    assert "repetition_penalty" not in mock_tts_model.generate_kwargs
+    assert "max_tokens" not in mock_tts_model.generate_kwargs
+    assert mock_tts_model.generate_kwargs["max_audio_length_ms"] == 2000
+
+
+def test_tts_speech_passes_advanced_generate_parameters(
+    client,
+    mock_model_provider,
+    tmp_path,
+):
+    class MockAdvancedTTSModel:
+        sample_rate = 16000
+
+        def __init__(self):
+            self.generate_kwargs = None
+
+        def generate(self, input_text: str, **kwargs):
+            del input_text
+            self.generate_kwargs = kwargs
+            yield MockAudioResult(np.ones(1600, dtype=np.float32), self.sample_rate)
+
+    ref_path = tmp_path / "voice.wav"
+    audio_write(ref_path, np.ones(1600, dtype=np.float32), 16000, format="wav")
+
+    mock_tts_model = MockAdvancedTTSModel()
+    mock_model_provider.load_model = MagicMock(return_value=mock_tts_model)
+
+    payload = {
+        "model": "advanced-tts",
+        "input": "Hello world",
+        "response_format": "wav",
+        "voice": "conversational_b",
+        "speaker": 2,
+        "voice_match": False,
+        "ref_audio": str(ref_path),
+        "ref_text": "Reference transcript.",
+        "temperature": 0.6,
+        "top_p": 0.8,
+        "top_k": 25,
+        "repetition_penalty": 1.2,
+        "max_tokens": 320,
+        "max_audio_length_ms": 4_000,
+        "gender": "female",
+        "pitch": 1.1,
+        "speed": 0.9,
+    }
+    response = client.post("/v1/audio/speech", json=payload)
+
+    assert response.status_code == 200
+    kwargs = mock_tts_model.generate_kwargs
+    assert kwargs is not None
+    assert kwargs["voice"] == "conversational_b"
+    assert kwargs["speaker"] == 2
+    assert kwargs["voice_match"] is False
+    assert kwargs["ref_text"] == "Reference transcript."
+    assert kwargs["temperature"] == 0.6
+    assert kwargs["top_p"] == 0.8
+    assert kwargs["top_k"] == 25
+    assert kwargs["repetition_penalty"] == 1.2
+    assert kwargs["max_tokens"] == 320
+    assert kwargs["max_audio_length_ms"] == 4_000
+    assert kwargs["gender"] == "female"
+    assert kwargs["pitch"] == 1.1
+    assert kwargs["speed"] == 0.9
+    assert hasattr(kwargs["ref_audio"], "shape")
+    assert kwargs["ref_audio"].shape[0] > 0
 
 
 def test_stt_transcriptions_bad_model_returns_404(client, mock_model_provider):
